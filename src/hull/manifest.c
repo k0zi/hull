@@ -13,7 +13,30 @@
  */
 
 #include "hull/manifest.h"
+#include "log.h"
 #include <string.h>
+
+/* ── CSP validation ─────────────────────────────────────────────────── */
+
+/*
+ * RT-06: Reject CSP strings that contain CR, LF, or NUL bytes.
+ * If any are present the caller must fall back to a safe default;
+ * otherwise the raw string would be written into HTTP headers and
+ * allow CRLF header injection (e.g. injecting Set-Cookie).
+ */
+static int csp_is_valid(const char *s)
+{
+    if (!s)
+        return 1; /* NULL means "disabled" — that is valid */
+    for (const char *p = s; *p; p++) {
+        if (*p == '\r' || *p == '\n') {
+            log_warn("[manifest] CSP string contains CR/LF — rejected "
+                     "(CRLF injection guard)");
+            return 0;
+        }
+    }
+    return 1;
+}
 
 #ifdef HL_ENABLE_LUA
 #include "lua.h"
@@ -92,8 +115,12 @@ int hl_manifest_extract(lua_State *L, HlManifest *out)
     /* csp = "policy-string" or false */
     lua_getfield(L, manifest_idx, "csp");
     if (lua_isstring(L, -1)) {
-        out->csp = lua_tostring(L, -1);
-        out->csp_set = 1;
+        const char *csp = lua_tostring(L, -1);
+        if (csp_is_valid(csp)) {
+            out->csp = csp;
+            out->csp_set = 1;
+        }
+        /* Invalid (CRLF-containing) CSP: leave csp_set=0 → caller uses default */
     } else if (lua_isboolean(L, -1) && !lua_toboolean(L, -1)) {
         out->csp = NULL;
         out->csp_set = 1;  /* explicitly disabled */
@@ -188,8 +215,14 @@ int hl_manifest_extract_js(JSContext *ctx, HlManifest *out)
     /* csp = "policy-string" or false */
     JSValue csp_val = JS_GetPropertyStr(ctx, manifest, "csp");
     if (JS_IsString(csp_val)) {
-        out->csp = JS_ToCString(ctx, csp_val);
-        out->csp_set = 1;
+        const char *csp = JS_ToCString(ctx, csp_val);
+        if (csp && csp_is_valid(csp)) {
+            out->csp = csp;
+            out->csp_set = 1;
+        } else if (csp) {
+            JS_FreeCString(ctx, csp);
+            /* Invalid CSP: leave csp_set=0 → caller uses default */
+        }
     } else if (JS_IsBool(csp_val) && !JS_ToBool(ctx, csp_val)) {
         out->csp = NULL;
         out->csp_set = 1;  /* explicitly disabled */

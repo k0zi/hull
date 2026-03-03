@@ -54,7 +54,7 @@
 /* ── Default Content-Security-Policy ───────────────────────────────── */
 
 #define HL_DEFAULT_CSP \
-    "default-src 'none'; style-src 'self' 'unsafe-inline'; " \
+    "default-src 'none'; style-src 'self'; " \
     "img-src 'self'; form-action 'self'; frame-ancestors 'none'"
 
 /* ── Logging ───────────────────────────────────────────────────────── */
@@ -293,7 +293,14 @@ static int hull_serve(int argc, char **argv)
         const char *slash = strrchr(entry_point, '/');
         if (slash) {
             size_t len = (size_t)(slash - entry_point);
-            if (len >= sizeof(app_dir)) len = sizeof(app_dir) - 1;
+            /* RT-02: hard-fail on overlong paths — silent truncation would
+             * point app_dir at a different directory, breaking sandbox,
+             * migrations, and signature verification. */
+            if (len >= sizeof(app_dir)) {
+                fprintf(stderr, "hull: entry point path too long (max %zu chars)\n",
+                        sizeof(app_dir) - 1);
+                return 1;
+            }
             memcpy(app_dir, entry_point, len);
             app_dir[len] = '\0';
         } else {
@@ -345,6 +352,12 @@ static int hull_serve(int argc, char **argv)
 
     /* Open SQLite database */
     sqlite3 *db = NULL;
+
+    /* RT-03: zero-initialize stmt_cache HERE — before any goto cleanup_db path —
+     * so hl_stmt_cache_destroy never iterates uninitialized memory. */
+    HlStmtCache stmt_cache;
+    memset(&stmt_cache, 0, sizeof(stmt_cache));
+
     int rc = sqlite3_open(db_path, &db);
     if (rc != SQLITE_OK) {
         log_error("[hull:c] cannot open database %s: %s",
@@ -370,7 +383,6 @@ static int hull_serve(int argc, char **argv)
     }
 
     /* Initialize prepared statement cache */
-    HlStmtCache stmt_cache;
     hl_stmt_cache_init(&stmt_cache, db);
 
     /* Initialize Keel server */
@@ -468,6 +480,18 @@ static int hull_serve(int argc, char **argv)
         goto cleanup_server;
     }
 
+    /* RT-01: Verify app signature BEFORE loading/evaluating the app.
+     * Loading executes module-level code; any side-effects (shell-out,
+     * DB writes, network calls) would occur before verification could
+     * reject the tampered file. */
+    if (verify_sig_path) {
+        if (hl_verify_startup(verify_sig_path, entry_point) != 0) {
+            log_error("[hull:c] signature verification failed — refusing to start");
+            goto cleanup_server;
+        }
+        log_info("[hull:c] signature verified OK");
+    }
+
     /* Load and evaluate the app */
     if (rt->vt->load_app(rt, entry_point) != 0) {
         log_error("[hull:c] failed to load %s", entry_point);
@@ -475,43 +499,7 @@ static int hull_serve(int argc, char **argv)
         goto cleanup_server;
     }
 
-    /* Verify app signature if requested */
-    if (verify_sig_path) {
-        if (hl_verify_startup(verify_sig_path, entry_point) != 0) {
-            log_error("[hull:c] signature verification failed — refusing to start");
-            rt->vt->destroy(rt);
-            goto cleanup_server;
-        }
-        log_info("[hull:c] signature verified OK");
-    }
-
-    /* Wire routes into Keel */
-    if (rt->vt->wire_routes_server(rt, &server, track_route_alloc) != 0) {
-        rt->vt->destroy(rt);
-        goto cleanup_server;
-    }
-
-    /* Auto-register static file serving */
-    {
-        extern const HlStaticEntry hl_app_static_entries[];
-        int has_static = (hl_app_static_entries[0].name != NULL);
-        if (!has_static) {
-            char static_dir[4096];
-            snprintf(static_dir, sizeof(static_dir), "%s/static", app_dir);
-            struct stat sdir;
-            if (stat(static_dir, &sdir) == 0 && S_ISDIR(sdir.st_mode))
-                has_static = 1;
-        }
-        if (has_static) {
-            HlStaticCtx *sctx = track_route_alloc(sizeof(HlStaticCtx));
-            sctx->app_dir = app_dir;
-            sctx->entries = (const HlStaticEntry *)hl_app_static_entries;
-            kl_server_use(&server, "GET", "/static/*",
-                          hl_static_middleware, sctx);
-        }
-    }
-
-    /* Extract manifest and configure capabilities */
+    /* Extract manifest BEFORE sandbox — needed to build the unveil/pledge set */
     HlManifest manifest;
     memset(&manifest, 0, sizeof(manifest));
     if (rt->vt->extract_manifest(rt, &manifest) == 0) {
@@ -573,7 +561,9 @@ static int hull_serve(int argc, char **argv)
         rt->http_cfg = &http_cfg_storage;
     }
 
-    /* Apply kernel sandbox (pledge/unveil) from manifest */
+    /* RT-04: Apply kernel sandbox BEFORE wiring routes and static files.
+     * pledge() seals the process here; all subsequent setup and every
+     * request handler run inside the sandbox constraints. */
     if (hl_sandbox_apply(&manifest, app_dir, db_path, ca_bundle_path,
                           tls_cert_path, tls_key_path) != 0) {
         log_error("[hull:c] sandbox enforcement failed");
@@ -582,6 +572,35 @@ static int hull_serve(int argc, char **argv)
         if (client_tls_ctx)
             kl_tls_mbedtls_ctx_destroy(client_tls_ctx);
         goto cleanup_server;
+    }
+
+    /* Wire routes into Keel */
+    if (rt->vt->wire_routes_server(rt, &server, track_route_alloc) != 0) {
+        rt->vt->free_manifest_strings(rt, &manifest);
+        rt->vt->destroy(rt);
+        if (client_tls_ctx)
+            kl_tls_mbedtls_ctx_destroy(client_tls_ctx);
+        goto cleanup_server;
+    }
+
+    /* Auto-register static file serving */
+    {
+        extern const HlStaticEntry hl_app_static_entries[];
+        int has_static = (hl_app_static_entries[0].name != NULL);
+        if (!has_static) {
+            char static_dir[4096];
+            snprintf(static_dir, sizeof(static_dir), "%s/static", app_dir);
+            struct stat sdir;
+            if (stat(static_dir, &sdir) == 0 && S_ISDIR(sdir.st_mode))
+                has_static = 1;
+        }
+        if (has_static) {
+            HlStaticCtx *sctx = track_route_alloc(sizeof(HlStaticCtx));
+            sctx->app_dir = app_dir;
+            sctx->entries = (const HlStaticEntry *)hl_app_static_entries;
+            kl_server_use(&server, "GET", "/static/*",
+                          hl_static_middleware, sctx);
+        }
     }
 
     log_info("[hull:c] listening on %s://%s:%d (%s runtime)",
